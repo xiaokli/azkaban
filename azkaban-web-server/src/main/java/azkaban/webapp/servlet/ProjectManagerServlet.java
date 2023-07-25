@@ -42,6 +42,7 @@ import azkaban.scheduler.Schedule;
 import azkaban.scheduler.ScheduleManager;
 import azkaban.scheduler.ScheduleManagerException;
 import azkaban.server.AzkabanAPI;
+import azkaban.server.HttpRequestUtils;
 import azkaban.server.session.Session;
 import azkaban.user.Permission;
 import azkaban.user.Permission.Type;
@@ -93,6 +94,10 @@ import org.quartz.SchedulerException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static azkaban.Constants.*;
+import static azkaban.project.FeatureFlag.*;
+
+
 public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
 
   private static final String API_GET_PROJECT_ID = "getProjectId";
@@ -107,6 +112,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
   private static final String API_GET_GROUP_PERMISSIONS = "getGroupPermissions";
   private static final String API_GET_PROXY_USERS = "getProxyUsers";
   private static final String API_CHANGE_PERMISSION = "changePermission";
+  private static final String API_CHANGE_UPLOAD_SETTING = "changeUploadSetting";
+  private static final String API_FETCH_UPLOAD_SETTING = "getUploadSetting";
   private static final String API_ADD_PERMISSION = "addPermission";
   private static final String API_ADD_PROXY_USER = "addProxyUser";
   private static final String API_REMOVE_PROXY_USER = "removeProxyUser";
@@ -123,6 +130,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
   static final String FLOW_IS_LOCKED_PARAM = "isLocked";
   static final String FLOW_NAME_PARAM = "flowName";
   static final String FLOW_ID_PARAM = "flowId";
+  public static final String ADHOC_UPLOAD = "adhocUpload";
   static final String ERROR_PARAM = "error";
   static final String FLOW_LOCK_ERROR_MESSAGE_PARAM = "flowLockErrorMessage";
 
@@ -148,6 +156,9 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
   private boolean lockdownCreateProjects = false;
   private boolean lockdownUploadProjects = false;
   private boolean enableQuartz = false;
+  private boolean disableAdhocUploadWhenProjectUploadLocked = false;
+  private boolean disableJobPropsOverrideWhenProjectUploadLocked = false;
+  private String uploadPrivilegeUser;
   private Map<String, List<HTMLFormElement>> alerterPlugins;
 
   public ProjectManagerServlet() {
@@ -186,6 +197,16 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         server.getServerProps().getInt(PROJECT_DOWNLOAD_BUFFER_SIZE_IN_BYTES, 8192);
     logger.info("downloadBufferSize: " + this.downloadBufferSize);
 
+    // get upload privilege user, if not configured, treated upload as adhoc, no upload lock enabled
+    // this feature flag is fundamental for project security feature enhanced by upload
+    this.uploadPrivilegeUser = server.getServerProps().get(AZKABAN_UPLOAD_PRIVILEGE_USER);
+    // a separate feature flag to disable adhoc upload when project upload lock is enabled
+    this.disableAdhocUploadWhenProjectUploadLocked =
+        server.getServerProps().getBoolean(AZKABAN_DISABLE_ADHOC_UPLOAD_ON_LOCKED, false);
+    // a separate feature flag to disable job props override when project upload lock is enabled
+    this.disableJobPropsOverrideWhenProjectUploadLocked =
+        server.getServerProps().getBoolean(AZKABAN_DISABLE_JOB_PROPS_OVERRIDE_ON_LOCKED, false);
+
     final Map<String, List<HTMLFormElement>> alerterPlugins = new HashMap<>();
     server.getAlerterPlugins().forEach((name, alerter) -> alerterPlugins.put(name,
         (alerter.getViewParameters() != null ? alerter.getViewParameters()
@@ -207,6 +228,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     apiEndpoints.add(new AzkabanAPI("ajax", API_GET_GROUP_PERMISSIONS));
     apiEndpoints.add(new AzkabanAPI("ajax", API_GET_PROXY_USERS));
     apiEndpoints.add(new AzkabanAPI("ajax", API_CHANGE_PERMISSION));
+    apiEndpoints.add(new AzkabanAPI("ajax", API_CHANGE_UPLOAD_SETTING));
+    apiEndpoints.add(new AzkabanAPI("ajax", API_FETCH_UPLOAD_SETTING));
     apiEndpoints.add(new AzkabanAPI("ajax", API_ADD_PERMISSION));
     apiEndpoints.add(new AzkabanAPI("ajax", API_ADD_PROXY_USER));
     apiEndpoints.add(new AzkabanAPI("ajax", API_REMOVE_PROXY_USER));
@@ -378,6 +401,17 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         if (handleAjaxPermission(project, user, Type.ADMIN, ret)) {
           ajaxAddPermission(project, ret, req, user);
         }
+      } else if (API_CHANGE_UPLOAD_SETTING.equals(ajaxName)) {
+        if (hasAzkabanAdminPermission(user)) {
+          ajaxChangeUploadSetting(project, ret, req, user);
+        } else {
+          ret.put(ERROR_PARAM, "User " + user.getUserId() + " doesn't have permission to change "
+              + "upload lock settings.");
+        }
+      } else if (API_FETCH_UPLOAD_SETTING.equals(ajaxName)) {
+        if (handleAjaxPermission(project, user, Type.READ, ret)) {
+          ajaxGetUploadSettings(project, ret);
+        }
       } else if (API_ADD_PROXY_USER.equals(ajaxName)) {
         if (session != null && !validateCSRFToken(req)) {
           writeJSON(resp, ImmutableMap.of("error", "CSRF validation failed."));
@@ -407,6 +441,13 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
           ajaxFetchJobInfo(project, ret, req);
         }
       } else if (API_SET_JOB_OVERRIDE_PROPERTY.equals(ajaxName)) {
+        if (uploadPrivilegeUser != null && disableJobPropsOverrideWhenProjectUploadLocked && project.isUploadLocked()) {
+          ret.put(ERROR_PARAM, "Project " + projectName + "is locked for editing job property while upload privilege user "
+              + "is set to " + uploadPrivilegeUser + ". If you really need to edit job property, "
+              + "please contact oncall to remove this lock.");
+          resp.setStatus(HttpServletResponse.SC_FORBIDDEN);
+          return;
+        }
         if (handleAjaxPermission(project, user, Type.WRITE, ret)) {
           ajaxSetJobOverrideProperty(project, ret, req, user);
         }
@@ -790,6 +831,37 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     } catch (final ProjectManagerException e) {
       ret.put(ERROR_PARAM, e.getMessage());
     }
+  }
+
+  private void ajaxChangeUploadSetting(final Project project,
+      final HashMap<String, Object> ret, final HttpServletRequest req, final User user) {
+    if (req.getParameter(ADHOC_UPLOAD) == null) {
+      ret.put(ERROR_PARAM, "adhocUpload parameter is not set");
+      return;
+    }
+    try {
+      final boolean enableAdhocProject = HttpRequestUtils.getBooleanParam(req, ADHOC_UPLOAD);
+      if (enableAdhocProject) {
+        project.addFeatureFlags(ENABLE_PROJECT_ADHOC_UPLOAD, true);
+        project.setUploadLock(false);
+      } else {
+        project.addFeatureFlags(ENABLE_PROJECT_ADHOC_UPLOAD, false);
+        if (project.getLastModifiedUser().equals(uploadPrivilegeUser)) {
+          project.setUploadLock(true);
+        }
+      }
+      project.setLastModifiedUser(user.getUserId());
+      project.setLastModifiedTimestamp(System.currentTimeMillis());
+
+      this.projectManager.updateProjectFeatureFlag(project, user);
+    } catch (ServletException | ProjectManagerException e) {
+      ret.put(ERROR_PARAM, e.getMessage());
+    }
+  }
+
+  private void ajaxGetUploadSettings(final Project project, final HashMap<String, Object> ret) {
+      ret.put("isUploadLocked", project.isUploadLocked());
+      ret.put("adhocUpload", project.isAdhocUploadEnabled());
   }
 
   private void ajaxFetchJobInfo(final Project project, final HashMap<String, Object> ret,
@@ -1328,10 +1400,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         page.add("projectName", project.getName());
         page.add("projectId", project.getId());
         //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
+        addProjectSidebarProperties(page, project);
 
         page.add("admins", Utils.flattenToString(
             project.getUsersWithPermission(Type.ADMIN), ","));
@@ -1452,11 +1521,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         }
 
         page.add("projectName", project.getName());
-        //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
+        addProjectSidebarProperties(page, project);
 
         page.add("username", user.getUserId());
         page.add("admins", Utils.flattenToString(
@@ -1496,6 +1561,32 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     page.render();
   }
 
+  /**
+   * Project sidebar properties shared by multiple web pages are added here.
+   *
+   * @param page the page to add properties to
+   * @param project the current project to add properties from
+   * */
+  private void addProjectSidebarProperties(Page page, Project project) {
+    // basic project properties
+    page.add("description", project.getDescription());
+    page.add("createTimestamp", project.getCreateTimestamp());
+    page.add("lastModifiedTimestamp", project.getLastModifiedTimestamp());
+    page.add("lastModifiedUser", project.getLastModifiedUser());
+
+    // params for project upload
+    // show if a project has prod identifier
+    page.add("projectUploadLock", uploadPrivilegeUser != null && project.isUploadLocked());
+    page.add("adhocUpload", project.isAdhocUploadEnabled());
+    page.add("showUploadLockPanel", uploadPrivilegeUser != null);
+    // only show adhocUpload changeable button when this feature is enabled
+    page.add("showAdhocUploadFeature",
+        uploadPrivilegeUser != null && disableAdhocUploadWhenProjectUploadLocked);
+    // hide upload project button when project prod identifier is set
+    page.add("hideUploadProjectButton",
+        uploadPrivilegeUser != null && disableAdhocUploadWhenProjectUploadLocked && project.isUploadLocked());
+  }
+
   private void handleJobPage(final HttpServletRequest req, final HttpServletResponse resp,
       final Session session) throws ServletException {
     final Page page = newPage(req, resp, session, "azkaban/webapp/servlet/velocity/jobpage.vm");
@@ -1517,6 +1608,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         throw new AccessControlException("No permission to view project " + projectName + ".");
       }
       page.add("projectName", project.getName());
+      page.add("hideJobPropsEdit",
+          uploadPrivilegeUser != null && disableJobPropsOverrideWhenProjectUploadLocked && project.isUploadLocked());
 
       final Flow flow = project.getFlow(flowNodePath);
       if (flow == null) {
@@ -1786,10 +1879,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         page.add("projectName", project.getName());
         page.add("projectId", project.getId());
         //params for projectsidebar
-        page.add("description",project.getDescription());
-        page.add("createTimestamp",project.getCreateTimestamp());
-        page.add("lastModifiedTimestamp",project.getLastModifiedTimestamp());
-        page.add("lastModifiedUser",project.getLastModifiedUser());
+        addProjectSidebarProperties(page, project);
 
         page.add("admins", Utils.flattenToString(
             project.getUsersWithPermission(Type.ADMIN), ","));
@@ -1900,6 +1990,17 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     if (project == null) {
       return;
     }
+
+    // fail the upload if the project is UPLOAD locked and the user is not the upload privilege user
+    // and the cluster-wide disableAdhocUpload flag is set
+    if (uploadPrivilegeUser != null && disableAdhocUploadWhenProjectUploadLocked
+        && project.isUploadLocked() && !user.getUserId().equals(uploadPrivilegeUser)) {
+      registerError(ret, "Installation Failed. Project '" + projectName + " has UPLOAD LOCK on. \n"
+          + "Create a new project to use adhoc upload feature, as crt deployed project would be automatically locked.\n"
+          + "If you really need enable adhoc upload on the current project, please contact oncall to remove this lock.",
+          resp, HttpServletResponse.SC_FORBIDDEN);
+      return;
+    }
     final FileItem item = (FileItem) multipart.get("file");
     final String name = item.getName();
     final String lowercaseExtension = FilenameUtils.getExtension(name).toLowerCase();
@@ -1938,18 +2039,20 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
       out = new BufferedOutputStream(new FileOutputStream(archiveFile));
       IOUtils.copy(item.getInputStream(), out);
       out.close();
-      if (this.enableQuartz) {
-        //todo chengren311: should maintain atomicity,
-        // e.g, if uploadProject fails, associated schedule shouldn't be added.
-        this.scheduler.unschedule(project);
-      }
 
       // get the locked flows for the project, so that they can be locked again after upload
       final List<Pair<String, String>> lockedFlows = getLockedFlows(project);
+      // record the existing project flows before upload
+      final List<Flow> existingFlows = project.getFlows();
 
+      // validate project zip's dependencies and persist the new project metadata into DB
       final Map<String, ValidationReport> reports = this.projectManager
           .uploadProject(project, archiveFile, lowercaseExtension, user, props, uploaderIPAddr);
+
+      // Post-processing after upload
+      // reschedule data triggers if quartz is enabled
       if (this.enableQuartz) {
+        this.scheduler.unschedule(existingFlows, projectName);
         this.scheduler.schedule(project, user.getUserId());
       }
 
@@ -1963,6 +2066,23 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         this.projectManager.postProjectEvent(project, EventType.SCHEDULE, "azkaban",
                 "Schedule " + schedule.toString() + " has been removed.");
       });
+
+      // uploader is upload privilege user and the project is not protected by feature flag enable.project.adhoc.upload
+      // mark the project with UPLOAD LOCK if it is not already, and persist in DB
+      if (!project.isAdhocUploadEnabled() && user.getUserId().equals(uploadPrivilegeUser) && !project.isUploadLocked()) {
+        project.setUploadLock(true);
+        this.projectManager.updateProjectSetting(project);
+        logger.info("Project {} is PROD", project.getName());
+      } else if (uploadPrivilegeUser != null && !user.getUserId().equals(uploadPrivilegeUser)) {
+        // when project security lock feature is turned on (only prod project flows would be allowed to push to prod cluster)
+        // and uploader not the upload privileged user, we want to reset prod lock status to false
+        // so that we remain the same restriction "prod project flows would be allowed to push to prod cluster"
+        // regardless we enable/disable AdhocUploadWhenProjectUploadLocked completely
+        project.setUploadLock(false);
+        this.projectManager.updateProjectSetting(project);
+        logger.info("Project {} is non PROD due to uploader {} is not uploadPrivilegeUser {}",
+            project.getName(), user.getUserId(), uploadPrivilegeUser);
+      }
 
       registerErrorsAndWarningsFromValidationReport(resp, ret, reports);
       // Reload the flow_filter to ensure if this project is added to the file, then the filter is current.
@@ -2045,12 +2165,11 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
    * @param onDeletedSchedule a callback function to execute with every deleted schedule
    */
   static void removeScheduleOfDeletedFlows(final Project project,
-      final ScheduleManager scheduleManager, final Consumer<Schedule> onDeletedSchedule)
-      throws ScheduleManagerException {
+      final ScheduleManager scheduleManager, final Consumer<Schedule> onDeletedSchedule) {
     final Set<String> flowNameList = project.getFlows().stream().map(f -> f.getId()).collect(
         Collectors.toSet());
 
-    for (final Schedule schedule : scheduleManager.getSchedules()) {
+    for (final Schedule schedule : scheduleManager.getAllSchedules()) {
       if (schedule.getProjectId() == project.getId() &&
           !flowNameList.contains(schedule.getFlowName())) {
         scheduleManager.removeSchedule(schedule);

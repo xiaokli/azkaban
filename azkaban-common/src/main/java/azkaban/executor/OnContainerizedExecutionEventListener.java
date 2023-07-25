@@ -1,6 +1,9 @@
 package azkaban.executor;
 
+import static azkaban.Constants.FlowParameters.FLOW_PARAM_RETRY_STRATEGY;
+
 import azkaban.Constants;
+import azkaban.Constants.FlowRetryStrategy;
 import azkaban.DispatchMethod;
 import azkaban.flow.Flow;
 import azkaban.flow.FlowUtils;
@@ -37,29 +40,57 @@ public class OnContainerizedExecutionEventListener implements OnExecutionEventLi
 
   /**
    * A new execution will be dispatched based on the original ExecutableFLow
-   * @param exFlow original ExecutableFlow in EXECUTION_STOPPED state
+   * @param originalExFlow original ExecutableFlow in EXECUTION_STOPPED state
    */
-  private void restartExecutableFlow(final ExecutableFlow exFlow) {
+  void restartExecutableFlow(final ExecutableFlow originalExFlow) {
     // Enable restartability for containerized execution
-    if (exFlow.getDispatchMethod() != DispatchMethod.CONTAINERIZED) return;
+    if (originalExFlow.getDispatchMethod() != DispatchMethod.CONTAINERIZED) return;
 
     // Create a new ExecutableFlow based on existing flow in EXECUTION_STOPPED state
     final Project project;
     final Flow flow;
     try {
-      project = FlowUtils.getProject(this.projectManager, exFlow.getProjectId());
-      flow = FlowUtils.getFlow(project, exFlow.getFlowId());
+      project = FlowUtils.getProject(this.projectManager, originalExFlow.getProjectId());
+      flow = FlowUtils.getFlow(project, originalExFlow.getFlowId());
     } catch (final RuntimeException e) {
       logger.error(e.getMessage());
       return;
     }
-    final ExecutableFlow executableFlow =
+    ExecutableFlow retryExFlow =
         this.executorManagerAdapter.createExecutableFlow(project, flow);
-    executableFlow.setSubmitUser(exFlow.getSubmitUser());
-    executableFlow.setExecutionSource(Constants.EXECUTION_SOURCE_ADHOC);
-    executableFlow.setUploadUser(project.getUploadUser());
+
+    final ExecutionOptions options = originalExFlow.getExecutionOptions();
+
+    final String retryStrategyStr = options.getFlowParameters()
+        .getOrDefault(FLOW_PARAM_RETRY_STRATEGY, FlowRetryStrategy.DEFAULT.getName());
+
+    // shouldn't throw an exception since the string value was validated on execution submission
+    FlowRetryStrategy retryStrategy = FlowRetryStrategy.valueFromName(retryStrategyStr);
+    logger.info(String.format("Retry execution of exec Id %d should use %s strategy.",
+        originalExFlow.getExecutionId(), retryStrategy));
+
+    switch (retryStrategy) {
+      case DISABLE_SUCCEEDED_NODES:
+        try {
+          disableSucceededSkippedJobsInRetryFlow(originalExFlow, retryExFlow);
+        } catch (ExecutorManagerException e){
+          // TODO: consider notify user via email too
+          logger.error(String.format(
+                  "Fail to restart execution %s due to error applying %s restart-strategy",
+                  originalExFlow.getExecutionId(),
+                  FlowRetryStrategy.DISABLE_SUCCEEDED_NODES),
+              e);
+        }
+        break;
+      default:
+        logger.info(String.format("Use default strategy when restarting the execution %s",
+          originalExFlow.getExecutionId()));
+    }
+
+    retryExFlow.setSubmitUser(originalExFlow.getSubmitUser());
+    retryExFlow.setExecutionSource(Constants.EXECUTION_SOURCE_RETRY);
+    retryExFlow.setUploadUser(project.getUploadUser());
     // Set up flow ExecutionOptions
-    final ExecutionOptions options = exFlow.getExecutionOptions();
     if(!options.isFailureEmailsOverridden()) {
       options.setFailureEmails(flow.getFailureEmails());
     }
@@ -70,22 +101,95 @@ public class OnContainerizedExecutionEventListener implements OnExecutionEventLi
     // Update the flow options so that the flow will be not retried again by Azkaban
 
     // inherent the retry time counters
-    executableFlow.setUserDefinedRetryCount(exFlow.getUserDefinedRetryCount());
-    executableFlow.setSystemDefinedRetryCount(exFlow.getSystemDefinedRetryCount());
+    retryExFlow.setUserDefinedRetryCount(originalExFlow.getUserDefinedRetryCount());
+    retryExFlow.setSystemDefinedRetryCount(originalExFlow.getSystemDefinedRetryCount());
 
-    // If a retried flow A gets retried again with a new execution id flow B, the original flow
-    // execution id of flow B should be the same as flow A's original flow execution id.
-    if (options.getOriginalFlowExecutionIdBeforeRetry() == null) {
-      options.setOriginalFlowExecutionIdBeforeRetry(exFlow.getExecutionId());
+    if (originalExFlow.getFlowRetryRootExecutionID() > 0) {
+      retryExFlow.setFlowRetryRootExecutionID(originalExFlow.getFlowRetryRootExecutionID());
+    } else {
+      retryExFlow.setFlowRetryRootExecutionID(originalExFlow.getExecutionId());
     }
-    executableFlow.setExecutionOptions(options);
+    retryExFlow.setFlowRetryParentExecutionID(originalExFlow.getExecutionId());
+
+    retryExFlow.setExecutionOptions(options);
     // Submit new flow for execution
     try {
-      logger.info("Restarting flow " + project.getName() + "." + executableFlow.getFlowName());
-      this.executorManagerAdapter.submitExecutableFlow(executableFlow,
-          executableFlow.getSubmitUser());
+      logger.info("Restarting flow " + project.getName() + "." + retryExFlow.getFlowName());
+      this.executorManagerAdapter.submitExecutableFlow(retryExFlow,
+          retryExFlow.getSubmitUser());
     } catch (final ExecutorManagerException e) {
-      logger.error("Failed to restart flow "+ executableFlow.getFlowId() + ". " + e.getMessage());
+      logger.error("Failed to restart flow "+ retryExFlow.getFlowId() + ". " + e.getMessage());
+      return;
+    }
+
+    try {
+      originalExFlow.setFlowRetryChildExecutionID(retryExFlow.getExecutionId());
+      this.executorLoader.updateExecutableFlow(originalExFlow);
+    } catch (final ExecutorManagerException e) {
+      logger.error("Failed to update the original flow after restart"
+          + originalExFlow.getFlowId() + ". " + e.getMessage());
+    }
+
+    // TODO: consider send out email for this information
+    // update the original executable-flow with retry-count and child executionID
+    logger.info(String.format("Retry execution [%d] successfully, "
+            + "spawning child-execution [%d], and its root-execution was [%d];"
+            + "system-defined retry count=%d, user-defined retry-count=%d.",
+        originalExFlow.getExecutionId(), retryExFlow.getExecutionId(),
+        retryExFlow.getFlowRetryRootExecutionID(),
+        retryExFlow.getSystemDefinedRetryCount(), retryExFlow.getUserDefinedRetryCount()));
+  }
+
+
+  /**
+   * DFS walk through of the executableFlow, update the retry-flow's job status to disabled if
+   * the corresponding job status in origin-flow is considered success/skip/disable.
+   */
+  public static void disableSucceededSkippedJobsInRetryFlow(
+      final ExecutableNode originalFlow,
+      final ExecutableNode retryingFlow) throws ExecutorManagerException {
+    // validate the 2 input nodes are matching
+    if (originalFlow == null && retryingFlow == null){
+      return;
+    }
+    if ((originalFlow == null) != (retryingFlow == null)){
+      throw new ExecutorManagerException(
+          String.format("Null check failed: input Original flow node = %s, Retrying flow node %s",
+              originalFlow, retryingFlow));
+    }
+    if (!originalFlow.getId().equals(retryingFlow.getId())){
+      throw new ExecutorManagerException(
+          String.format("Input Original flow node ID %s != Retrying flow node ID %s",
+              originalFlow.getId(), retryingFlow.getId()));
+    }
+    if ((originalFlow instanceof ExecutableFlowBase)
+        != (retryingFlow instanceof ExecutableFlowBase)) {
+      throw new ExecutorManagerException(
+          String.format("Input Original flow node %s is `ExecutableFlowBase` "
+                  + "but Retrying flow node %s is not",
+              originalFlow.getId(), retryingFlow.getId()));
+    }
+
+    // recursively walk through the children if is a "flow or subflow"
+    if (originalFlow instanceof ExecutableFlowBase){
+      final ExecutableFlowBase originBase = (ExecutableFlowBase) originalFlow;
+      final ExecutableFlowBase retryBase = (ExecutableFlowBase) retryingFlow;
+      for (ExecutableNode subNode : originBase.getExecutableNodes()) {
+        disableSucceededSkippedJobsInRetryFlow(
+            subNode, retryBase.getExecutableNode(subNode.getId()));
+      }
+    }
+    // set status DISABLED at the end if all children is good
+    switch (originalFlow.getStatus()) {
+      case SUCCEEDED:
+      case FAILED_SUCCEEDED:
+      case DISABLED:
+        retryingFlow.setStatus(Status.DISABLED);
+        break;
+      case SKIPPED:
+        retryingFlow.setStatus(Status.SKIPPED);
+        // fall through
+      default:
     }
   }
 }

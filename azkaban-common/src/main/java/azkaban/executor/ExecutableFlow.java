@@ -15,6 +15,12 @@
  */
 package azkaban.executor;
 
+import static azkaban.Constants.EventReporterConstants.FLOW_RETRY_CHILD_EXECUTION_ID;
+import static azkaban.Constants.EventReporterConstants.FLOW_RETRY_PARENT_EXECUTION_ID;
+import static azkaban.Constants.EventReporterConstants.FLOW_RETRY_ROOT_EXECUTION_ID;
+import static azkaban.Constants.EventReporterConstants.SYSTEM_DEFINED_FLOW_RETRY_COUNT_PARAM;
+import static azkaban.Constants.EventReporterConstants.USER_DEFINED_FLOW_RETRY_COUNT_PARAM;
+
 import azkaban.DispatchMethod;
 import azkaban.flow.Flow;
 import azkaban.imagemgmt.version.VersionSet;
@@ -54,6 +60,7 @@ public class ExecutableFlow extends ExecutableFlowBase {
   public static final String SLAOPTIONS_PARAM = "slaOptions";
   public static final String AZKABANFLOWVERSION_PARAM = "azkabanFlowVersion";
   public static final String IS_LOCKED_PARAM = "isLocked";
+  public static final String IS_PRODUCTION_FLOW_PARAM = "isProductionFlow";
   public static final String IS_OOM_Killed_PARAM = "isOOMKilled";
   public static final String IS_VPA_Enabled_PARAM = "isVPAEnabled";
   public static final String FLOW_LOCK_ERROR_MESSAGE_PARAM = "flowLockErrorMessage";
@@ -62,10 +69,8 @@ public class ExecutableFlow extends ExecutableFlowBase {
   public static final String VERSIONSET_JSON_PARAM = "versionSetJson";
   public static final String VERSIONSET_MD5HEX_PARAM = "versionSetMd5Hex";
   public static final String VERSIONSET_ID_PARAM = "versionSetId";
-  private static final String PARAM_OVERRIDE = "param.override.";
-  private static final String PROJECT_FILE_UPLOAD_USER = "uploadUser";
-  private static final String USER_DEFINED_FLOW_RETRY_COUNT_PARAM = "userDefinedFlowRetryCount";
-  private static final String SYSTEM_DEFINED_FLOW_RETRY_COUNT_PARAM = "systemDefinedFlowRetryCount";
+  public static final String PARAM_OVERRIDE = "param.override.";
+  public static final String PROJECT_FILE_UPLOAD_USER = "uploadUser";
 
   private final HashSet<String> proxyUsers = new HashSet<>();
   private int executionId = -1;
@@ -82,7 +87,11 @@ public class ExecutableFlow extends ExecutableFlowBase {
   private String executionPath;
   private ExecutionOptions executionOptions;
   private double azkabanFlowVersion;
+  // flow lock, once locked, the flow won't be able to execute/be modified/be scheduled...
   private boolean isLocked;
+  // If the flow is a part of production project, i.e. the project is enabled with UploadLock,
+  // then the generated executable flow will mark as production flow.
+  private boolean isProductionFlow;
   private boolean isOOMKilled = false;
   private boolean isVPAEnabled = false;
   private ExecutableFlowRampMetadata executableFlowRampMetadata;
@@ -95,6 +104,10 @@ public class ExecutableFlow extends ExecutableFlowBase {
   private int userDefinedRetryCount = 0;
   // how many times flow level retry happened due to stuck in "Dispatch/Preparing/Ready" status
   private int systemDefinedRetryCount = 0;
+  // The IDs of the original ancestor root exec / the direct parent exec / the retried child exec
+  private int flowRetryRootExecutionID = -1;
+  private int flowRetryParentExecutionID = -1;
+  private int flowRetryChildExecutionID = -1;
 
   // For slaOption information
   private String slaOptionStr = "null";
@@ -113,6 +126,7 @@ public class ExecutableFlow extends ExecutableFlowBase {
     this.uploadUser = project.getUploadUser();
     setAzkabanFlowVersion(flow.getAzkabanFlowVersion());
     setLocked(flow.isLocked());
+    setProductionFlowMarker(project.isUploadLocked());
     setFlowLockErrorMessage(flow.getFlowLockErrorMessage());
     this.setFlow(project, flow);
   }
@@ -286,6 +300,13 @@ public class ExecutableFlow extends ExecutableFlowBase {
 
   public void setLocked(boolean locked) { this.isLocked = locked; }
 
+  public void setProductionFlowMarker(boolean isUploadLockEnabled) {
+    this.isProductionFlow = isUploadLockEnabled;
+  }
+  public boolean getProductionFlowMarker() {
+    return this.isProductionFlow;
+  }
+
   public boolean isOOMKilled() { return this.isOOMKilled; }
 
   public void setOOMKilled(boolean oomKilled) { this.isOOMKilled = oomKilled; }
@@ -327,6 +348,31 @@ public class ExecutableFlow extends ExecutableFlowBase {
   public void setSystemDefinedRetryCount(int systemDefinedRetryCount) {
     this.systemDefinedRetryCount = systemDefinedRetryCount;
   }
+
+  public int getFlowRetryRootExecutionID() {
+    return flowRetryRootExecutionID;
+  }
+
+  public void setFlowRetryRootExecutionID(int flowRetryRootExecutionID) {
+    this.flowRetryRootExecutionID = flowRetryRootExecutionID;
+  }
+
+  public int getFlowRetryParentExecutionID() {
+    return flowRetryParentExecutionID;
+  }
+
+  public void setFlowRetryParentExecutionID(int flowRetryParentExecutionID) {
+    this.flowRetryParentExecutionID = flowRetryParentExecutionID;
+  }
+
+  public int getFlowRetryChildExecutionID() {
+    return flowRetryChildExecutionID;
+  }
+
+  public void setFlowRetryChildExecutionID(int flowRetryChildExecutionID) {
+    this.flowRetryChildExecutionID = flowRetryChildExecutionID;
+  }
+
 
   @Override
   public Map<String, Object> toObject() {
@@ -370,6 +416,7 @@ public class ExecutableFlow extends ExecutableFlowBase {
     flowObj.put(SYSTEM_DEFINED_FLOW_RETRY_COUNT_PARAM, this.systemDefinedRetryCount);
 
     flowObj.put(IS_LOCKED_PARAM, this.isLocked);
+    flowObj.put(IS_PRODUCTION_FLOW_PARAM, this.isProductionFlow);
     flowObj.put(IS_OOM_Killed_PARAM, this.isOOMKilled);
     flowObj.put(IS_VPA_Enabled_PARAM, this.isVPAEnabled);
     flowObj.put(FLOW_LOCK_ERROR_MESSAGE_PARAM, this.flowLockErrorMessage);
@@ -381,6 +428,10 @@ public class ExecutableFlow extends ExecutableFlowBase {
       flowObj.put(VERSIONSET_MD5HEX_PARAM, this.versionSet.getVersionSetMd5Hex());
       flowObj.put(VERSIONSET_ID_PARAM, this.versionSet.getVersionSetId());
     }
+
+    flowObj.put(FLOW_RETRY_ROOT_EXECUTION_ID, flowRetryRootExecutionID);
+    flowObj.put(FLOW_RETRY_PARENT_EXECUTION_ID, flowRetryParentExecutionID);
+    flowObj.put(FLOW_RETRY_CHILD_EXECUTION_ID, flowRetryChildExecutionID);
 
     return flowObj;
   }
@@ -446,12 +497,17 @@ public class ExecutableFlow extends ExecutableFlowBase {
     }
 
     this.setLocked(flowObj.getBool(IS_LOCKED_PARAM, false));
+    this.setProductionFlowMarker(flowObj.getBool(IS_PRODUCTION_FLOW_PARAM, false));
     this.setOOMKilled(flowObj.getBool(IS_OOM_Killed_PARAM, false));
     this.setVPAEnabled(flowObj.getBool(IS_VPA_Enabled_PARAM, false));
     this.setFlowLockErrorMessage(flowObj.getString(FLOW_LOCK_ERROR_MESSAGE_PARAM, null));
     // Dispatch Method default is POLL
     this.setDispatchMethod(DispatchMethod.fromNumVal(flowObj.getInt(FLOW_DISPATCH_METHOD,
         DispatchMethod.POLL.getNumVal())));
+
+    this.setFlowRetryRootExecutionID(flowObj.getInt(FLOW_RETRY_ROOT_EXECUTION_ID));
+    this.setFlowRetryParentExecutionID(flowObj.getInt(FLOW_RETRY_PARENT_EXECUTION_ID));
+    this.setFlowRetryChildExecutionID(flowObj.getInt(FLOW_RETRY_CHILD_EXECUTION_ID));
   }
 
   @Override

@@ -88,6 +88,17 @@ public class ScheduleManager implements TriggerAgent {
       }
       s.unlock();
     }
+    // remove any schedules that are marked "removed" in triggerManager
+    for (int id : this.loader.loadRemovedTriggers()) {
+      Schedule s = this.scheduleIDMap.get(id);
+      if (s != null) {
+        final Pair<Integer, String> identityPairMap = s.getScheduleIdentityPair();
+        if (identityPairMap != null) {
+          this.scheduleIdentityPairMap.remove(identityPairMap);
+        }
+      }
+      this.scheduleIDMap.remove(id);
+    }
   }
 
   private void onScheduleExpire(final Schedule s) {
@@ -103,13 +114,25 @@ public class ScheduleManager implements TriggerAgent {
   }
 
   /**
-   * Retrieves a copy of the list of schedules.
+   * Retrieves a copy of the list of updated schedules.
    */
   public List<Schedule> getSchedules()
       throws ScheduleManagerException {
     final List<Schedule> updates = this.loader.loadUpdatedSchedules();
     refreshLocal(updates);
     return new ArrayList<>(this.scheduleIDMap.values());
+  }
+
+  /**
+   * Retrieves a copy of the list of all schedules regardless the status, active or inactive ones.
+   */
+  public List<Schedule> getAllSchedules() {
+    try {
+      return this.loader.loadAllSchedules();
+    } catch (ScheduleManagerException e) {
+      logger.error("Failed to load all schedules", e);
+      return new ArrayList<>();
+    }
   }
 
   /**

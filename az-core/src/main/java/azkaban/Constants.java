@@ -17,6 +17,9 @@
 package azkaban;
 
 import java.time.Duration;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.stream.Collectors;
 
 /**
  * Constants used in configuration files or shared among classes.
@@ -135,6 +138,7 @@ public class Constants {
 
   // Specifies the source(adhoc, scheduled, event) from where flow execution is triggered
   public static final String EXECUTION_SOURCE_ADHOC = "adhoc";
+  public static final String EXECUTION_SOURCE_RETRY = "retry";
   public static final String EXECUTION_SOURCE_SCHEDULED = "schedule";
   public static final String EXECUTION_SOURCE_EVENT = "event";
 
@@ -186,6 +190,20 @@ public class Constants {
 
   public static final int DEFAULT_AZKABAN_SERVER_EXTERNAL_ANALYZER_TIMEOUT_MS = 1000;
 
+  /*
+   * project upload would be locked once privilege user uploads a project,
+   * locked means no other users can upload, the restriction only apply when @link{AZKABAN_DISABLE_ADHOC_UPLOAD_ON_LOCKED} = true
+   */
+  public static final String AZKABAN_UPLOAD_PRIVILEGE_USER = "azkaban.upload.privilege.user";
+  /*
+   * Disable adhoc upload on upload-locked projects
+   */
+  public static final String AZKABAN_DISABLE_ADHOC_UPLOAD_ON_LOCKED = "azkaban.disable.adhoc.upload.on.locked";
+  /*
+   * Disable job properties edit via UI or API on upload-locked projects
+   */
+  public static final String AZKABAN_DISABLE_JOB_PROPS_OVERRIDE_ON_LOCKED = "azkaban.disable.job.props.override.on.locked";
+
   // Azkaban event reporter constants
   public static class EventReporterConstants {
 
@@ -209,8 +227,6 @@ public class Constants {
     public static final String FLOW_PREPARATION_DURATION = "flowPreparationDuration";
     public static final String IS_OOM_KILLED = "isOOMKilled";
     public static final String IS_POD_SIZE_AUTOSCALING_ENABLED = "isPodSizeAutoscaled";
-    public static final String ORIGINAL_FLOW_EXECUTION_ID_BEFORE_RETRY =
-        "originalFlowExecutionIdBeforeRetry";
     public static final String SLA_OPTIONS = "slaOptions";
     public static final String VERSION_SET = "versionSet";
     public static final String EXECUTOR_TYPE = "executorType";
@@ -231,6 +247,11 @@ public class Constants {
     public static final String CPU_UTILIZED = "cpuUtilized";
     public static final String MEMORY_UTILIZED_IN_BYTES = "memoryUtilizedInBytes";
     public static final String EXECUTION_SOURCE = "executionSource";
+    public static final String USER_DEFINED_FLOW_RETRY_COUNT_PARAM = "userDefinedFlowRetryCount";
+    public static final String SYSTEM_DEFINED_FLOW_RETRY_COUNT_PARAM = "systemDefinedFlowRetryCount";
+    public static final String FLOW_RETRY_ROOT_EXECUTION_ID = "flowRetryRootExecutionID";
+    public static final String FLOW_RETRY_PARENT_EXECUTION_ID = "flowRetryParentExecutionID";
+    public static final String FLOW_RETRY_CHILD_EXECUTION_ID = "flowRetryChildExecutionID";
   }
 
   public static class ConfigurationKeys {
@@ -564,6 +585,13 @@ public class Constants {
     public static final String AZKABAN_FLOW_SUBMIT_USER = "azkaban.flow.submituser";
     public static final String AZKABAN_FLOW_EXEC_ID = "azkaban.flow.execid";
     public static final String AZKABAN_FLOW_PROJECT_VERSION = "azkaban.flow.projectversion";
+    /*
+    * The Production Flow Concept is a properties to pass and leverage inside each job, it is optional for each job to
+    * realize the job should have production access or not.
+    * In the current version of Azkaban, we treat a flow as a production flow only when the project of the flow
+    * is uploaded by "upload.privilege.user".
+    * */
+    public static final String AZKABAN_FLOW_PRODUCTION_MARKER = "azkaban.flow.production.marker";
   }
 
   public static class JobProperties {
@@ -870,14 +898,44 @@ public class Constants {
         "allow.restart.on.execution.stopped";
     public static final String PROXY_USER_PREFETCH_ALL = "proxy.user.prefetch.all";
 
-    // Constant to define allow restart on a set of terminated status, extends to more statuses
+    // Constant to define allow retry on a set of terminated status, extends to more statuses
     // e.g. "flow.retry.statuses=EXECUTION_STOPPED,FAILED"
-    public static final String FLOW_PARAM_ALLOW_RESTART_ON_STATUS = "flow.retry.statuses";
+    public static final String FLOW_PARAM_ALLOWED_RETRY_STATUS = "flow.retry.statuses";
 
-    // Constant to define at most how many times can restart the flow
+    // Constant to define at most how many times can retry the flow
     public static final String FLOW_PARAM_MAX_RETRIES = "flow.max.retries";
 
-    // Constant to define the strategy to restart the execution, default to "restart_from_root",
-    public static final String FLOW_PARAM_RESTART_STRATEGY = "flow.retry.strategy";
+    // Constant to define the strategy to retry the execution, default to "retryAsNew",
+    public static final String FLOW_PARAM_RETRY_STRATEGY = "flow.retry.strategy";
+  }
+
+  public enum FlowRetryStrategy {
+    // default retry strategy, restart the execution in a whole, fresh new
+    DEFAULT("retryAsNew"),
+    // retry the execution but disabling the corresponding succeeded nodes in previous execution
+    DISABLE_SUCCEEDED_NODES("disableSucceededNodes");
+
+    private final String name;
+    private FlowRetryStrategy(String name) {
+      this.name = name;
+    }
+
+    public String getName() {
+      return this.name;
+    }
+
+    public static FlowRetryStrategy valueFromName(String name) {
+      for(FlowRetryStrategy s: FlowRetryStrategy.values()) {
+        if(s.name.equals(name)) {
+          return s;
+        }
+      }
+      throw new IllegalArgumentException("No FlowRetryStrategy for name " + name);
+    }
+
+    public static List<String> getNames() {
+      return EnumSet.allOf(FlowRetryStrategy.class).stream()
+          .map(FlowRetryStrategy::getName).collect(Collectors.toList());
+    }
   }
 }

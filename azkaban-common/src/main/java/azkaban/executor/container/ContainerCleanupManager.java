@@ -163,6 +163,8 @@ public class ContainerCleanupManager {
           .info("NumberFormatException while parsing value for: " + AZKABAN_MAX_FLOW_RUNNING_MINS);
     }
 
+    // When adding new status in this map, also update ContainerizationMetricsImpl to add the
+    // corresponding metrics for the status.
     this.validityMap = new Builder<Status,
         Pair<Duration, String>>()
         .put(Status.DISPATCHING,
@@ -175,18 +177,16 @@ public class ContainerCleanupManager {
             new Pair<>(Duration.ofMinutes(runningFlowValidity), START_TIME))
         .build();
 
+    // The task will find executions of these statuses and kill all their yarn applications,
+    // ONLY under these set of statuses should their yarn-app being killed.
+    // Counter case: if execution is FAILED, yarn-apps of those jobs defined with "fail-finishing"
+    // should continue running until finish, thus cannot clean them up.
     this.recentTerminatedStatusMap = new Builder<Status, Pair<Duration, String>>()
         .put(Status.EXECUTION_STOPPED,
             new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
         .put(Status.KILLED,
             new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
         .put(Status.KILLING,
-            new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
-        .put(Status.FAILED,
-            new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
-        .put(Status.FAILED_FINISHING,
-            new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
-        .put(Status.FAILED_SUCCEEDED,
             new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
         .put(Status.CANCELLED,
             new Pair<>(Duration.ofMinutes(recentTerminationValidity), UPDATE_TIME))
@@ -470,6 +470,8 @@ public class ContainerCleanupManager {
     List<ExecutableFlow> staleFlows;
     try {
       staleFlows = this.executorLoader.fetchStaleFlowsForStatus(status, this.validityMap);
+      // emit metrics around stale flows of this status
+      this.containerizationMetrics.addCleanupStaleStatusFlowNumber(status.name(), staleFlows.size());
     } catch (final Exception e) {
       logger.error("Exception occurred while fetching stale flows during clean up." + e);
       return;

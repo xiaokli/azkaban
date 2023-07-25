@@ -17,6 +17,9 @@
 package azkaban.scheduler;
 
 import azkaban.Constants;
+import azkaban.flow.Flow;
+import azkaban.flow.FlowUtils;
+import azkaban.flow.NoSuchAzkabanResourceException;
 import azkaban.metrics.MetricsManager;
 import azkaban.project.Project;
 import azkaban.project.ProjectManager;
@@ -27,11 +30,16 @@ import azkaban.utils.Emailer;
 import azkaban.utils.Props;
 import azkaban.utils.TimeUtils;
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.Gauge;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import java.text.MessageFormat;
+import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -62,8 +70,10 @@ public class MissedSchedulesManager {
   private final int threadPoolSize;
   private final int DEFAULT_THREAD_POOL_SIZE = 5;
   private final Counter emailCounter;
-  private final Counter missScheduleCounter;
-  private final Counter backExecutionCounter;
+  private final Counter missScheduleCounter; // total number of missed schedules
+  private final Counter missScheduleWithNonBackExecutionEnabledCounter; // number of missed schedules with no back execution enabled
+  private final Counter missScheduleWithBackExecutionEnabledCounter; // number of missed schedules with back execution enabled
+  private final Counter backExecutionCounter; // back execution happened when missed schedule is detected
 
   @Inject
   public MissedSchedulesManager(final Props azkProps,
@@ -76,6 +86,11 @@ public class MissedSchedulesManager {
     this.missedSchedulesManagerEnabled = azkProps.getBoolean(Constants.MISSED_SCHEDULE_MANAGER_ENABLED, false);
     this.emailCounter = metricsManager.addCounter("missed-schedule-email-notification-count");
     this.missScheduleCounter = metricsManager.addCounter("missed-schedule-count");
+    this.missScheduleWithNonBackExecutionEnabledCounter =
+        metricsManager.addCounter("missed-schedule-non-back-exec-part-count");
+    this.missScheduleWithBackExecutionEnabledCounter =
+        metricsManager.addCounter("missed-schedule-back-exec-part-count");
+
     this.backExecutionCounter = metricsManager.addCounter("missed-schedule-back-execution-count");
     if (this.missedSchedulesManagerEnabled && this.threadPoolSize <= 0) {
       final String errorMsg =
@@ -94,19 +109,17 @@ public class MissedSchedulesManager {
    * */
   public boolean addMissedSchedule(final List<Long> missedScheduleTimesInMs,
       @NotNull final ExecuteFlowAction action,
-      final boolean backExecutionEnabled) {
+      final boolean backExecutionEnabled) throws NoSuchAzkabanResourceException {
     if (!this.missedSchedulesManagerEnabled) {
       LOG.warn("missed Schedule manager is not enabled, can not add tasks.");
       return false;
     }
-    final String projectId = action.getProjectName();
+    final int projectId = action.getProjectId();
     final String flowName = action.getFlowName();
-    final Project project = this.projectManager.getProject(projectId);
-    if (project == null) {
-      return false;
-    }
+    final Project project = FlowUtils.getProject(projectManager, projectId);
+    final Flow flow = FlowUtils.getFlow(project, flowName);
     LOG.info("received a missed schedule on times {} by action {}", missedScheduleTimesInMs, action.toJson());
-    List<String> emailRecipients = project.getFlow(flowName).getFailureEmails();
+    List<String> emailRecipients = flow.getFailureEmails();
     if (action.getExecutionOptions().isFailureEmailsOverridden()) {
       emailRecipients = action.getExecutionOptions().getFailureEmails();
     }
@@ -121,7 +134,10 @@ public class MissedSchedulesManager {
       }
       if (backExecutionEnabled) {
         this.backExecutionCounter.inc();
+        this.missScheduleWithBackExecutionEnabledCounter.inc(missedScheduleTimesInMs.size());
         LOG.info("Missed schedule task submitted with email recipients {} and action {}", emailRecipients, action);
+      } else {
+        this.missScheduleWithNonBackExecutionEnabledCounter.inc(missedScheduleTimesInMs.size());
       }
       return true;
     } catch (final RejectedExecutionException e) {
