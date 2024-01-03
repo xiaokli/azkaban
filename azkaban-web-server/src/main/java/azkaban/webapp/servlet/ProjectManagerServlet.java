@@ -55,6 +55,7 @@ import azkaban.utils.JSONUtils;
 import azkaban.utils.Pair;
 import azkaban.utils.Props;
 import azkaban.utils.PropsUtils;
+import azkaban.utils.SecurityTag;
 import azkaban.utils.Utils;
 import azkaban.webapp.AzkabanWebServer;
 import com.google.common.annotations.VisibleForTesting;
@@ -95,7 +96,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static azkaban.Constants.*;
-import static azkaban.project.FeatureFlag.*;
+import static azkaban.Constants.ConfigurationKeys.ENABLE_SECURITY_CERT_MANAGEMENT;
+import static azkaban.project.FeatureFlag.ENABLE_PROJECT_ADHOC_UPLOAD;
 
 
 public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
@@ -156,6 +158,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
   private boolean lockdownCreateProjects = false;
   private boolean lockdownUploadProjects = false;
   private boolean enableQuartz = false;
+  private boolean enableSecurityCertManagement = false;
   private boolean disableAdhocUploadWhenProjectUploadLocked = false;
   private boolean disableJobPropsOverrideWhenProjectUploadLocked = false;
   private String uploadPrivilegeUser;
@@ -180,6 +183,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     this.scheduleManager = server.getScheduleManager();
     this.userManager = server.getUserManager();
     this.scheduler = server.getFlowTriggerScheduler();
+    this.enableSecurityCertManagement = server.getServerProps().getBoolean(ENABLE_SECURITY_CERT_MANAGEMENT, false);
     this.lockdownCreateProjects =
         server.getServerProps().getBoolean(ConfigurationKeys.LOCKDOWN_CREATE_PROJECTS_KEY, false);
     this.enableQuartz = server.getServerProps().getBoolean(ConfigurationKeys.ENABLE_QUARTZ, false);
@@ -760,12 +764,15 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
     this.writeJSON(resp, ret);
   }
 
-  private void removeAssociatedSchedules(final Project project) throws ServletException {
+  private void removeAssociatedSchedules(final Project project, final User user) throws ServletException {
     // remove regular schedules
     try {
       for (final Schedule schedule : this.scheduleManager.getSchedules()) {
         if (schedule.getProjectId() == project.getId()) {
-          logger.info("removing schedule {} for project {}", schedule.getScheduleId(), project.getName());
+          logger.info("removing schedule {} for project {} due to project being removed",
+              schedule.getScheduleId(), project.getName());
+          this.projectManager.postProjectEvent(project, EventType.SCHEDULE, user.getUserId(),
+              "removing schedule due to project removed " + schedule.getScheduleId());
           this.scheduleManager.removeSchedule(schedule);
         }
       }
@@ -805,7 +812,7 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
       return;
     }
 
-    removeAssociatedSchedules(project);
+    removeAssociatedSchedules(project, user);
 
     try {
       this.projectManager.removeProject(project, user);
@@ -1948,7 +1955,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
       status = ERROR_PARAM;
     } else {
       try {
-        this.projectManager.createProject(projectName, projectDescription, user);
+        this.projectManager.createProject(projectName, projectDescription, user,
+            enableSecurityCertManagement ? SecurityTag.NEW_PROJECT : null);
         status = "success";
         action = "redirect";
         final String redirect = "manager?project=" + projectName;
@@ -2064,7 +2072,8 @@ public class ProjectManagerServlet extends LoginAbstractAzkabanServlet {
         logger.info("Removed schedule with id {} of renamed/deleted flow: {} from project: {}.",
                 schedule.getScheduleId(), schedule.getFlowName(), schedule.getProjectName());
         this.projectManager.postProjectEvent(project, EventType.SCHEDULE, "azkaban",
-                "Schedule " + schedule.toString() + " has been removed.");
+                "Schedule " + schedule.toString() +
+                    " has been removed due to the flow has been removed or renamed during upload process.");
       });
 
       // uploader is upload privilege user and the project is not protected by feature flag enable.project.adhoc.upload

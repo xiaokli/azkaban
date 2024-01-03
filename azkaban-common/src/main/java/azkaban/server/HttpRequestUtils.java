@@ -42,8 +42,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.servlet.ServletException;
@@ -236,7 +238,7 @@ public class HttpRequestUtils {
     if (flowParameters.containsKey(FlowParameters.FLOW_PARAM_RETRY_STRATEGY)){
       String restartStrategy = flowParameters.get(FlowParameters.FLOW_PARAM_RETRY_STRATEGY);
       try {
-        FlowRetryStrategy restartStrategyEnum = FlowRetryStrategy.valueOf(restartStrategy);
+        FlowRetryStrategy restartStrategyEnum = FlowRetryStrategy.valueFromName(restartStrategy);
       } catch (IllegalArgumentException e){
         errMsg.add(String.format("Invalid %s = %s. Valid values are: %s",
             FlowParameters.FLOW_PARAM_RETRY_STRATEGY, restartStrategy,
@@ -276,6 +278,11 @@ public class HttpRequestUtils {
       params.remove(FlowParameters.FLOW_PARAM_DISABLE_POD_CLEANUP);
       // Passing test version will be allowed for Azkaban ADMIN role only
       params.remove(FlowParameters.FLOW_PARAM_ALLOW_IMAGE_TEST_VERSION);
+
+      // "azkaban.{job|flow}" prefix should be runtime generated, not config-able
+      params.entrySet().removeIf(e ->
+          e.getKey().startsWith("azkaban.flow") || e.getKey().startsWith("azkaban.job"));
+
     } else {
       validateIntegerParam(params, ExecutionOptions.FLOW_PRIORITY);
       validateIntegerParam(params, ExecutionOptions.USE_EXECUTOR);
